@@ -1,0 +1,326 @@
+/***************************************************
+ *  ESP32 Solar Monitor + OLED + Blynk + Relay Control
+ *  Demo Version with Simulated Battery Discharge
+ ***************************************************/
+#define BLYNK_TEMPLATE_ID "TMPL3f9EfuwxC"
+#define BLYNK_TEMPLATE_NAME "Solar Monitor"
+#define BLYNK_AUTH_TOKEN "ytpOhl7Q9tC_uqDTgR1oowYcezftR9NM" 
+
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <BlynkSimpleEsp32.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_GFX.h>
+#include <Wire.h>
+#include <Arduino.h>
+#include <math.h>
+#include <TimeLib.h>
+#include <WidgetRTC.h>
+#include <Preferences.h>   // For saving data
+
+Preferences preferences;   // NVS storage handler
+
+// --- WiFi credentials ---
+char ssid[] = "DEBOJYOTI";  
+char pass[] = "debojyoti@123";    
+
+// --- OLED setup ---
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// --- Pin mapping (Sensors) ---
+const int PIN_GEN_V   = 35;
+const int PIN_GEN_I   = 34;
+const int PIN_BATT_V  = 33;
+const int PIN_BATT_I  = 32;
+const int PIN_LOAD1_I = 25;
+const int PIN_LOAD2_I = 26;
+
+// --- Pin mapping (Relays & Switches) ---
+#define RELAY1_PIN 4
+#define RELAY2_PIN 5
+#define SWITCH1_PIN 27
+#define SWITCH2_PIN 14
+
+// --- ACS712 constants ---
+float ACS_SENSITIVITY = 0.185; // 185 mV/A
+
+// --- Calibration factors ---
+const float VOLTAGE_DIVIDER_RATIO = 11.0;
+const float ADC_RESOLUTION = 4095.0;
+const float REF_VOLTAGE = 3.3;
+const float BATTERY_NOMINAL_VOLTAGE = 3.7;
+const float LOAD_RESISTANCE = 220.0;
+
+// --- Variables ---
+float power_generation_W = 0;
+float power_storage_W = 0;
+float power_consumption_W = 0;
+float energy_generated_Wh = 0;       // lifetime
+float daily_energy_generated_Wh = 0; // daily reset
+float energy_consumed_Wh = 0;
+float battery_percentage = 100.0;    // start full for demo
+
+// ACS offsets
+float offset_GEN = 2.5;
+float offset_BATT = 2.5;
+float offset_L1 = 2.5;
+float offset_L2 = 2.5;
+
+// --- Blynk virtual pins ---
+#define VPIN_GEN_POWER   V0
+#define VPIN_BATT_POWER  V1
+#define VPIN_LOAD_POWER  V2
+#define VPIN_ENERGY_GEN  V3
+#define VPIN_ENERGY_CONS V4
+#define VP_LOAD1         V5
+#define VP_LOAD2         V6
+#define VP_BATT_PERCENT  V7
+#define VP_ENERGY_DAILY  V8
+
+// --- State Variables for loads ---
+int load1State = 0;
+int load2State = 0;
+int lastSwitch1 = HIGH;
+int lastSwitch2 = HIGH;
+
+// --- Timer ---
+BlynkTimer timer;
+WidgetRTC rtc;
+
+// --- Smart Load thresholds ---
+const float BATT_LOW_THRESHOLD  = 30.0;  
+const float BATT_HIGH_THRESHOLD = 80.0;  
+const float SOLAR_ACTIVE_W      = 5.0;   
+
+// --- Smart control message ---
+String smartMessage = "";
+
+// ---------- Helper functions ----------
+float readVoltage(int pin) {
+  int raw = analogRead(pin);
+  return (raw / ADC_RESOLUTION) * REF_VOLTAGE * VOLTAGE_DIVIDER_RATIO;
+}
+
+float readCurrent(int pin, float offset) {
+  int raw = analogRead(pin);
+  float voltage = (raw / ADC_RESOLUTION) * REF_VOLTAGE;
+  float current = (voltage - offset) / ACS_SENSITIVITY;
+  if (fabs(current) < 0.05) current = 0;
+  return current;
+}
+
+float calibrateACS(int pin) {
+  long sum = 0;
+  for (int i = 0; i < 100; i++) {
+    sum += analogRead(pin);
+    delay(2);
+  }
+  float avg = sum / 100.0;
+  return (avg / ADC_RESOLUTION) * REF_VOLTAGE;
+}
+
+// ---------- Blynk update ----------
+void sendToBlynk() {
+  Blynk.virtualWrite(VPIN_GEN_POWER,   power_generation_W);
+  Blynk.virtualWrite(VPIN_BATT_POWER,  power_storage_W);
+  Blynk.virtualWrite(VPIN_LOAD_POWER,  power_consumption_W);
+  Blynk.virtualWrite(VPIN_ENERGY_GEN,  energy_generated_Wh);
+  Blynk.virtualWrite(VPIN_ENERGY_CONS, energy_consumed_Wh);
+  Blynk.virtualWrite(VP_BATT_PERCENT,  battery_percentage);
+  Blynk.virtualWrite(VP_ENERGY_DAILY,  daily_energy_generated_Wh);
+}
+
+// ---------- OLED update ----------
+void updateOLED() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(0, 0);
+  display.print("Gen: "); display.print(power_generation_W); display.println("W");
+
+  display.setCursor(0, 10);
+  display.print("Batt: "); display.print(power_storage_W); display.println("W");
+
+  display.setCursor(0, 20);
+  display.print("Load: "); display.print(power_consumption_W); display.println("W");
+
+  display.setCursor(0, 30);
+  display.print("E Gen: "); display.print(energy_generated_Wh); display.println("Wh");
+
+  display.setCursor(0, 40);
+  display.print("Daily: "); display.print(daily_energy_generated_Wh); display.println("Wh");
+
+  display.setCursor(0, 50);
+  display.print("Batt %: "); display.print(battery_percentage); display.println("%");
+
+  if (smartMessage != "") {
+    display.setCursor(0, 58);
+    display.print(smartMessage);
+  }
+
+  display.display();
+}
+
+// ---------- Measurements ----------
+void measurePower() {
+  float genV   = readVoltage(PIN_GEN_V);
+  float genI   = readCurrent(PIN_GEN_I, offset_GEN);
+
+  float battV_raw = readVoltage(PIN_BATT_V); 
+  float battI  = readCurrent(PIN_BATT_I, offset_BATT);
+
+  power_generation_W  = fabs(genV * genI);
+  power_storage_W     = fabs(battV_raw * battI);
+
+  float load_power_W = (BATTERY_NOMINAL_VOLTAGE * BATTERY_NOMINAL_VOLTAGE) / LOAD_RESISTANCE;
+  power_consumption_W = 0;
+  if (load1State) power_consumption_W += load_power_W;
+  if (load2State) power_consumption_W += load_power_W;
+
+  energy_generated_Wh       += power_generation_W / 3600.0;
+  daily_energy_generated_Wh += power_generation_W / 3600.0;
+  energy_consumed_Wh        += power_consumption_W / 3600.0;
+
+  // --- Simulated Battery % behavior ---
+  if (power_generation_W > power_consumption_W) {
+    battery_percentage += 0.05;  // charging
+  } else if (power_consumption_W > power_generation_W) {
+    battery_percentage -= 0.05;  // discharging
+  }
+  battery_percentage = constrain(battery_percentage, 0, 100);
+
+  // --- Save to flash ---
+  preferences.putFloat("egen",  energy_generated_Wh);
+  preferences.putFloat("edaily", daily_energy_generated_Wh);
+  preferences.putFloat("econs", energy_consumed_Wh);
+
+  updateOLED();
+
+  Serial.print("Gen: "); Serial.print(power_generation_W);
+  Serial.print(" | Batt: "); Serial.print(power_storage_W);
+  Serial.print(" | Load: "); Serial.print(power_consumption_W);
+  Serial.print(" | Egen: "); Serial.print(energy_generated_Wh);
+  Serial.print(" | Daily: "); Serial.print(daily_energy_generated_Wh);
+  Serial.print(" | Econs: "); Serial.print(energy_consumed_Wh);
+  Serial.print(" | Batt%: "); Serial.println(battery_percentage);
+}
+
+// ---------- Smart Load Control ----------
+void smartLoadControl() {
+  if (battery_percentage < BATT_LOW_THRESHOLD) {
+    load2State = 0;
+    digitalWrite(RELAY2_PIN, HIGH);
+    Blynk.virtualWrite(VP_LOAD2, load2State);
+    smartMessage = "LOW BATT -> Load2 OFF";
+  }
+  else if (battery_percentage > BATT_HIGH_THRESHOLD && power_generation_W > SOLAR_ACTIVE_W) {
+    load1State = 1; load2State = 1;
+    digitalWrite(RELAY1_PIN, LOW);
+    digitalWrite(RELAY2_PIN, LOW);
+    Blynk.virtualWrite(VP_LOAD1, load1State);
+    Blynk.virtualWrite(VP_LOAD2, load2State);
+    smartMessage = "SOLAR SURPLUS -> Load2 ON";
+  }
+  else {
+    load1State = 1;
+    digitalWrite(RELAY1_PIN, LOW);
+    Blynk.virtualWrite(VP_LOAD1, load1State);
+    smartMessage = "";
+  }
+}
+
+// ---------- Daily reset ----------
+void checkMidnight() {
+  if (hour() == 0 && minute() == 0) {
+    daily_energy_generated_Wh = 0;
+    preferences.putFloat("edaily", daily_energy_generated_Wh);
+    Serial.println("Daily energy reset at midnight!");
+    Blynk.virtualWrite(VP_ENERGY_DAILY, daily_energy_generated_Wh);
+    delay(60000);
+  }
+}
+
+// ---------- Relay Control from Blynk ----------
+BLYNK_WRITE(VP_LOAD1) {
+  load1State = param.asInt();
+  digitalWrite(RELAY1_PIN, load1State ? LOW : HIGH);
+}
+
+BLYNK_WRITE(VP_LOAD2) {
+  load2State = param.asInt();
+  digitalWrite(RELAY2_PIN, load2State ? LOW : HIGH);
+}
+
+// ---------- Setup ----------
+void setup() {
+  Serial.begin(115200);
+
+  preferences.begin("solarData", false);
+  energy_generated_Wh       = preferences.getFloat("egen", 0);
+  daily_energy_generated_Wh = preferences.getFloat("edaily", 0);
+  energy_consumed_Wh        = preferences.getFloat("econs", 0);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 failed"));
+    for (;;);
+  }
+  display.clearDisplay();
+  display.display();
+
+  pinMode(RELAY1_PIN, OUTPUT);
+  pinMode(RELAY2_PIN, OUTPUT);
+  pinMode(SWITCH1_PIN, INPUT_PULLUP);
+  pinMode(SWITCH2_PIN, INPUT_PULLUP);
+  digitalWrite(RELAY1_PIN, HIGH);
+  digitalWrite(RELAY2_PIN, HIGH);
+
+  WiFi.begin(ssid, pass);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("WiFi Connected");
+
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+  rtc.begin();
+
+  offset_GEN  = calibrateACS(PIN_GEN_I);
+  offset_BATT = calibrateACS(PIN_BATT_I);
+  offset_L1   = calibrateACS(PIN_LOAD1_I);
+  offset_L2   = calibrateACS(PIN_LOAD2_I);
+
+  timer.setInterval(1000L, measurePower);
+  timer.setInterval(5000L, sendToBlynk);
+  timer.setInterval(60000L, checkMidnight);
+  timer.setInterval(5000L, smartLoadControl);
+
+  Blynk.virtualWrite(VP_LOAD1, load1State);
+  Blynk.virtualWrite(VP_LOAD2, load2State);
+}
+
+// ---------- Loop ----------
+void loop() {
+  Blynk.run();
+  timer.run();
+
+  int sw1 = digitalRead(SWITCH1_PIN);
+  if (sw1 == LOW && lastSwitch1 == HIGH) {
+    load1State = !load1State;
+    digitalWrite(RELAY1_PIN, load1State ? LOW : HIGH);
+    Blynk.virtualWrite(VP_LOAD1, load1State);
+    delay(200);
+  }
+  lastSwitch1 = sw1;
+
+  int sw2 = digitalRead(SWITCH2_PIN);
+  if (sw2 == LOW && lastSwitch2 == HIGH) {
+    load2State = !load2State;
+    digitalWrite(RELAY2_PIN, load2State ? LOW : HIGH);
+    Blynk.virtualWrite(VP_LOAD2, load2State);
+    delay(200);
+  }
+  lastSwitch2 = sw2;
+}
